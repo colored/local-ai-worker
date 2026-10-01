@@ -85,15 +85,66 @@ class Redactor:
         return value
 
 
-def secret_container(path: str) -> bool:
+def secret_container(path: str, extra: list[str] | None = None) -> bool:
+    from fnmatch import fnmatchcase
     from pathlib import PurePosixPath
 
-    p = PurePosixPath(path.lower())
-    return p.suffix in {".key", ".p12", ".pfx", ".jks"} or p.name in {
-        "id_rsa",
-        "id_ed25519",
+    normalized = path.replace("\\", "/").lower()
+    p = PurePosixPath(normalized)
+    directories = {
+        ".ssh",
+        ".aws",
+        ".azure",
+        ".gcloud",
+        ".gnupg",
+        ".kube",
+        ".docker",
         "credentials",
-        ".netrc",
-        ".npmrc",
-        ".pypirc",
+        "secrets",
+        ".secrets",
+        ".password-store",
     }
+    return (
+        "/.config/gcloud/" in f"/{normalized}/"
+        or "/.local/share/keyrings/" in f"/{normalized}/"
+        or "/.config/op/" in f"/{normalized}/"
+        or normalized.endswith(".config/gh/hosts.yml")
+        or any(
+            part in directories or part == ".env" or part.startswith(".env.") for part in p.parts
+        )
+        or p.suffix in {".key", ".pem", ".p12", ".pfx", ".jks", ".keystore", ".kdbx"}
+        or p.name
+        in {
+            "id_rsa",
+            "id_dsa",
+            "id_ecdsa",
+            "id_ed25519",
+            "credentials",
+            "credentials.json",
+            "credentials.yml",
+            "credentials.yaml",
+            "secrets.json",
+            "secrets.yml",
+            "secrets.yaml",
+            "service-account.json",
+            "service_account.json",
+            "application_default_credentials.json",
+            ".netrc",
+            ".npmrc",
+            ".pypirc",
+            ".git-credentials",
+            ".gitcookies",
+            "kubeconfig",
+            "auth.json",
+            ".boto",
+            ".s3cfg",
+            ".pgpass",
+            ".my.cnf",
+            ".vault-token",
+        }
+        or any(
+            fnmatchcase(normalized, pattern.replace("\\", "/").lower())
+            or any(fnmatchcase(part, pattern.lower()) for part in p.parts)
+            for pattern in extra or []
+        )
+    )

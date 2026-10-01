@@ -6,7 +6,6 @@ from .files import Budget, read_text
 from .git import Git
 from .project import excerpt, is_test
 from .schemas import DiffRequest, WorkerError
-from .secrets import secret_container
 
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 FLAGS = ["--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--no-color", "--no-renames"]
@@ -42,7 +41,23 @@ def analyze(run: Run, settings, request: DiffRequest, budget: Budget):
             if request.mode == "combined"
             else []
         )
-    raw = git.run("diff", *FLAGS, "--name-status", "-z", *args, "--").split(b"\0")
+    # Even a name/status diff can read working-tree content. Select permitted
+    # paths from metadata before asking Git to compare anything.
+    candidates = set(git.inventory())
+    for ref in [base, head] if revision else [head]:
+        if ref != EMPTY_TREE:
+            candidates.update(
+                p.decode("utf-8")
+                for p in git.run("ls-tree", "-r", "--name-only", "-z", ref).split(b"\0")
+                if p
+            )
+    permitted = sorted(p for p in candidates if not budget.denied(p))
+    if len(permitted) < len(candidates):
+        run.limit("Credential-container paths were withheld before comparison.")
+    raw = b"".join(
+        git.run("diff", *FLAGS, "--name-status", "-z", *args, "--", *permitted[i : i + 40])
+        for i in range(0, len(permitted), 40)
+    ).split(b"\0")
     changes: list[tuple[str, str]] = []
     for index in range(0, len(raw) - 1, 2):
         if raw[index]:
@@ -52,7 +67,7 @@ def analyze(run: Run, settings, request: DiffRequest, budget: Budget):
         untracked = {
             p.decode("utf-8")
             for p in git.run("ls-files", "-z", "--others", "--exclude-standard").split(b"\0")
-            if p
+            if p and not budget.denied(p.decode("utf-8"))
         }
         changes.extend(("untracked", p) for p in sorted(untracked))
     summary = "\n".join(f"{status}\t{path}" for status, path in changes[:200])
@@ -68,7 +83,7 @@ def analyze(run: Run, settings, request: DiffRequest, budget: Budget):
     run.fact(f"{test_changes} changed paths match test heuristics.", [eid])
     captured = 0
     for status, path in changes[:60]:
-        if secret_container(path):
+        if budget.denied(path):
             run.limit("A credential-container change was withheld.")
             continue
         try:

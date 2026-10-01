@@ -8,7 +8,6 @@ from .evidence import Run
 from .files import Budget, contained, walk
 from .project import terms
 from .schemas import LogRequest, WorkerError
-from .secrets import secret_container
 
 TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}[T ][0-9:.]+(?:Z|[+-]\d{2}:?\d{2})?")
 LEVEL = re.compile(r"\b(TRACE|DEBUG|INFO|WARN(?:ING)?|ERROR|FATAL|CRITICAL)\b", re.I)
@@ -170,7 +169,7 @@ def analyze(run: Run, settings, request: LogRequest, budget: Budget):
     total = included = unknown_time = filtered = 0
     earliest = latest = None
     for path in sorted(paths):
-        if secret_container(path):
+        if budget.denied(path):
             budget.skipped["credential_container"] += 1
             continue
         try:

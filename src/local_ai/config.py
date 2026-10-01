@@ -35,6 +35,7 @@ class Settings(StrictModel):
     managed_model_switching: bool = False
     retention_days: int = Field(default=7, ge=0, le=36500)
     max_state_bytes: int = Field(default=268435456, ge=65536)
+    sensitive_path_patterns: list[str] = Field(default_factory=list, max_length=128)
     # Setting this affirms that the independently running daemon has cloud disabled.
     local_only_confirmed: bool = False
     max_entries: int = Field(default=50000, ge=1, le=1000000)

@@ -156,9 +156,7 @@ class Git:
         return paths
 
     def blob(self, path: str, revision: str | None, max_bytes: int) -> str | None:
-        from .secrets import secret_container
-
-        if secret_container(path):
+        if self.budget.denied(path):
             return None
         contained(self.root, path)
         spec = f"{revision}:{path}" if revision else f":{path}"

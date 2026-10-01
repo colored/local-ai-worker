@@ -22,11 +22,15 @@ EXCLUDED = {
 
 
 class Budget:
-    def __init__(self, seconds: float, max_bytes: int):
+    def __init__(self, seconds: float, max_bytes: int, sensitive_paths=None):
         self.deadline = time.monotonic() + seconds
         self.max_bytes = max_bytes
         self.bytes = 0
         self.skipped: Counter = Counter()
+        self.sensitive_paths = sensitive_paths or []
+
+    def denied(self, path: str) -> bool:
+        return secret_container(path, self.sensitive_paths)
 
     def check(self):
         if time.monotonic() >= self.deadline:
@@ -85,7 +89,8 @@ def walk(root: Path, start: str = ".", limit: int = 50000, *, logs: bool = False
 
 
 def read_text(root: Path, path: str, budget: Budget, max_file: int) -> str | None:
-    if secret_container(path):
+    budget.check()
+    if budget.denied(path):
         budget.skipped["credential_container"] += 1
         return None
     candidate = contained(root, path)

@@ -42,6 +42,7 @@ async def analyze(task, request, *, settings=None, mcp=False, transport=None):
     budget = Budget(
         min(deadline, 30),
         settings.max_log_bytes if task == "logs" else settings.max_source_bytes,
+        settings.sensitive_path_patterns,
     )
     try:
         # Execute in a thread so the stdio event loop can receive cancellation.

@@ -96,7 +96,11 @@ def inspect(run: Run, settings, focus: str | None, budget: Budget):
     if len(paths) > settings.max_entries:
         paths = paths[: settings.max_entries]
         run.limit("Inventory shortened to the configured entry limit.")
-    paths = [p for p in paths if not any(part in EXCLUDED for part in PurePosixPath(p).parts)]
+    paths = [
+        p
+        for p in paths
+        if not any(part in EXCLUDED for part in PurePosixPath(p).parts) and not budget.denied(p)
+    ]
     languages = Counter(
         LANGUAGES[PurePosixPath(p).suffix] for p in paths if PurePosixPath(p).suffix in LANGUAGES
     )
