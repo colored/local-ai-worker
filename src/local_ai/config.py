@@ -32,6 +32,8 @@ class Settings(StrictModel):
     state_dir: str = Field(default_factory=lambda: str(user_data_path("local-ai-worker")))
     additional_roots: list[str] = Field(default_factory=list)
     keep_alive: str = "5m"
+    retention_days: int = Field(default=7, ge=0, le=36500)
+    max_state_bytes: int = Field(default=268435456, ge=65536)
     # Setting this affirms that the independently running daemon has cloud disabled.
     local_only_confirmed: bool = False
     max_entries: int = Field(default=50000, ge=1, le=1000000)

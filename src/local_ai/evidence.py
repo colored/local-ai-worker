@@ -1,41 +1,53 @@
 import json
-import os
 import re
+import time
 import uuid
 from pathlib import Path
 
 from .schemas import Evidence, EvidencePage, EvidenceRef, Fact, ModelInfo, Result, WorkerError
 from .secrets import Redactor
-
-
-def private_dir(path: Path):
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.is_symlink():
-        raise WorkerError("STORE_INVALID", "Worker state must not be a symbolic link")
-    if os.name != "nt":
-        path.chmod(0o700)
-
-
-def write_json(path: Path, data):
-    with path.open("w", encoding="utf-8") as stream:
-        if os.name != "nt":
-            path.chmod(0o600)
-        json.dump(data, stream, ensure_ascii=False)
+from .store import OWNER, Lease, Store, no_links, private_dir, state_lock, write_json
 
 
 class Run:
-    def __init__(self, state: Path, root: Path, task: str, profile: str, redactor: Redactor):
+    def __init__(
+        self,
+        state: Path,
+        root: Path,
+        task: str,
+        profile: str,
+        redactor: Redactor,
+        *,
+        retention_days=7,
+        max_state_bytes=268435456,
+    ):
         self.root, self.redactor = root, redactor
         self.result = Result(run_id=uuid.uuid4().hex, task=task, model=ModelInfo(profile=profile))
         self.directory = state / "runs" / self.result.run_id
-        private_dir(self.directory / "evidence")
-        write_json(self.directory / "manifest.json", {"root": str(root)})
+        self.store = Store(state, retention_days, max_state_bytes)
+        self.manifest = {
+            "owner": OWNER,
+            "run_id": self.result.run_id,
+            "root": str(root),
+            "created": time.time(),
+            "status": "incomplete",
+        }
+        self.lease = None
+        with state_lock(state):
+            self.store.room(32768)
+            private_dir(state / "runs")
+            self.directory.mkdir(mode=0o700)
+            private_dir(self.directory / "evidence")
+            self.lease = Lease(self.directory / "active.lock")
+            write_json(self.directory / "manifest.json", self.manifest)
         self.items: list[Evidence] = []
         self.bytes = 0
 
     def add(
         self, text: str, path: str | None, source="file", lines=None, revision=None, side=None
     ) -> str:
+        if self.lease is None:
+            raise WorkerError("RUN_CLOSED", "The captured run is already closed")
         text, redacted = self.redactor.screen(text)
         if self.bytes + len(text.encode("utf-8")) > 2 * 1024 * 1024:
             raise WorkerError("EVIDENCE_LIMIT", "Captured evidence limit reached")
@@ -50,9 +62,9 @@ class Run:
             content=text,
             redacted=redacted,
         )
+        self.store.write(self.directory / "evidence" / f"{item.id}.json", item.model_dump())
         self.items.append(item)
         self.result.evidence.append(EvidenceRef(**item.model_dump(exclude={"content", "redacted"})))
-        write_json(self.directory / "evidence" / f"{item.id}.json", item.model_dump())
         return item.id
 
     def fact(self, text: str, evidence_ids: list[str] | None = None):
@@ -95,8 +107,23 @@ class Run:
         existing = {item.id for item in self.items}
         if not cited <= existing:
             raise WorkerError("INVALID_EVIDENCE", "Result contains invalid evidence references")
-        write_json(self.directory / "result.json", result.model_dump())
+        self.store.write(self.directory / "result.json", result.model_dump(), final=True)
+        self.close("complete")
         return result
+
+    def close(self, status="interrupted"):
+        if self.lease is None:
+            return
+        try:
+            self.manifest["status"] = status
+            self.store.write(self.directory / "manifest.json", self.manifest, final=True)
+        except (OSError, WorkerError):
+            # The durable initial marker remains incomplete if finalization cannot
+            # write (disk full, quota, competing state lock). Preserve cancellation.
+            pass
+        finally:
+            self.lease.close()
+            self.lease = None
 
 
 def retrieve(
@@ -113,6 +140,8 @@ def retrieve(
         raise WorkerError("NOT_FOUND", "Evidence is unavailable")
     directory = state / "runs" / run_id
     try:
+        no_links(directory / "manifest.json")
+        no_links(directory / "evidence" / f"{evidence_id}.json")
         root = Path(json.loads((directory / "manifest.json").read_text("utf-8"))["root"]).resolve()
         if not any(root == p or root.is_relative_to(p) for p in allowed):
             raise WorkerError("ROOT_NOT_ALLOWED", "Evidence belongs to another project")

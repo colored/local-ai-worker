@@ -1,7 +1,5 @@
 import asyncio
 import json
-import shutil
-from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -120,27 +118,14 @@ def serve():
 
 @app.command("clean")
 def clean():
-    """Remove captured worker runs, never target-project files."""
-    state = Path(load_settings().state_dir).expanduser().resolve()
-    runs = state / "runs"
-    if runs.is_symlink():
-        raise typer.BadParameter("Runs directory must not be a symlink")
-    import re
+    """Remove completed and stale incomplete worker runs; skip active runs."""
+    from .store import clean_runs
 
-    removed = 0
-    if runs.exists():
-        for directory in runs.iterdir():
-            if not re.fullmatch(r"[0-9a-f]{32}", directory.name) or directory.is_symlink():
-                continue
-            if (
-                directory.is_dir()
-                and (directory / "manifest.json").is_file()
-                and (directory / "result.json").is_file()
-            ):
-                target = directory.resolve()
-                if target.is_relative_to(runs.resolve()) and runs.resolve().is_relative_to(state):
-                    shutil.rmtree(target)
-                    removed += 1
+    try:
+        removed = clean_runs(load_settings())
+    except WorkerError as error:
+        typer.echo(f"{error.code}: {error}", err=True)
+        raise typer.Exit(2) from None
     typer.echo(f"Removed {removed} captured worker runs.")
 
 

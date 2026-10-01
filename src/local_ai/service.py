@@ -10,6 +10,7 @@ from .files import Budget
 from .ollama import assist
 from .schemas import WorkerError
 from .secrets import Redactor
+from .store import no_links
 
 logger = logging.getLogger("local_ai")
 
@@ -17,11 +18,21 @@ logger = logging.getLogger("local_ai")
 async def analyze(task, request, *, settings=None, mcp=False, transport=None):
     settings = settings or load_settings()
     root = project_root(settings, request.repo_root, mcp=mcp)
-    state = Path(settings.state_dir).expanduser().resolve()
+    state = Path(settings.state_dir).expanduser().absolute()
+    no_links(state)
+    state = state.resolve()
     if state == root or state.is_relative_to(root):
         raise WorkerError("STORE_SCOPE", "Worker state must be outside the target project")
     redactor = Redactor(settings.extra_secret_patterns)
-    run = Run(state, root, task, request.profile, redactor)
+    run = Run(
+        state,
+        root,
+        task,
+        request.profile,
+        redactor,
+        retention_days=settings.retention_days,
+        max_state_bytes=settings.max_state_bytes,
+    )
     query = request.query if task == "logs" else request.focus
     query = redactor.value(query)
     request = request.model_copy(update={"query" if task == "logs" else "focus": query})
@@ -29,7 +40,8 @@ async def analyze(task, request, *, settings=None, mcp=False, transport=None):
     profile = settings.profiles.get(request.profile)
     deadline = profile.deadline_seconds if profile else 120
     budget = Budget(
-        min(deadline, 30), settings.max_log_bytes if task == "logs" else settings.max_source_bytes
+        min(deadline, 30),
+        settings.max_log_bytes if task == "logs" else settings.max_source_bytes,
     )
     try:
         # Execute in a thread so the stdio event loop can receive cancellation.
@@ -41,7 +53,23 @@ async def analyze(task, request, *, settings=None, mcp=False, transport=None):
             else:
                 logs.analyze(run, settings, request, budget)
 
-        await asyncio.to_thread(operation)
+        collector = asyncio.create_task(asyncio.to_thread(operation))
+        try:
+            await asyncio.shield(collector)
+        except BaseException:
+            budget.deadline = 0
+            # Do not release the run lease or finalize while the collector can write.
+            # Repeated cancellation must not detach a still-running collector.
+            while not collector.done():
+                try:
+                    await asyncio.shield(collector)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if collector.done() and not collector.cancelled():
+                collector.exception()
+            raise
         remaining = deadline - (time.monotonic() - started)
         if remaining > 0 and run.items:
             await assist(run, settings, query, transport=transport, seconds=remaining)
@@ -49,7 +77,8 @@ async def analyze(task, request, *, settings=None, mcp=False, transport=None):
             run.limit("Analysis deadline reached before model assistance.")
     except asyncio.CancelledError:
         budget.deadline = 0
-        # Collector checks its budget before further reads and mutations.
+        run.close("cancelled")
+        # Collector has stopped before releasing the run lease.
         logger.info("operation=%s run=%s status=cancelled", task, run.result.run_id)
         raise
     except WorkerError as error:
@@ -60,16 +89,22 @@ async def analyze(task, request, *, settings=None, mcp=False, transport=None):
         run.limit("Input could not be processed safely; available results are partial.")
         if not run.result.facts:
             run.result.status = "failed"
-    run.result.statistics["elapsed_seconds"] = round(time.monotonic() - started, 3)
-    result = run.finish()
-    logger.info(
-        "operation=%s run=%s status=%s elapsed=%.3f",
-        task,
-        result.run_id,
-        result.status,
-        time.monotonic() - started,
-    )
-    return result
+    except BaseException:
+        run.close("interrupted")
+        raise
+    try:
+        run.result.statistics["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        result = run.finish()
+        logger.info(
+            "operation=%s run=%s status=%s elapsed=%.3f",
+            task,
+            result.run_id,
+            result.status,
+            time.monotonic() - started,
+        )
+        return result
+    finally:
+        run.close()
 
 
 def evidence(run_id, evidence_id, cursor=None, *, settings=None, mcp=False):
