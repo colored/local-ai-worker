@@ -1,51 +1,31 @@
 import asyncio
 import json
 import math
-import os
 from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
 
 from .context import assemble
-from .evidence import private_dir, write_json
+from .evidence import private_dir
 from .schemas import ModelReply, WorkerError
+from .store import Lease
 
 
 @contextmanager
 def inference_lock(state: Path):
     private_dir(state)
-    with (state / "inference.lock").open("a+b") as stream:
-        stream.seek(0)
-        stream.write(b"0")
-        stream.flush()
-        stream.seek(0)
-        acquired = False
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            acquired = True
-        except OSError:
-            pass
-        try:
-            yield acquired
-        finally:
-            if acquired:
-                if os.name == "nt":
-                    import msvcrt
-
-                    stream.seek(0)
-                    msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(stream, fcntl.LOCK_UN)
+    try:
+        lease = Lease(state / "inference.lock")
+    except WorkerError as error:
+        if error.code != "STORE_BUSY":
+            raise
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        lease.close()
 
 
 async def bounded_json(client, method: str, url: str, payload=None, cap=524288):
@@ -88,38 +68,19 @@ async def assist(run, settings, query: str | None, *, transport=None, seconds=No
                     transport=transport,
                 ) as client:
                     running = await bounded_json(client, "GET", "/api/ps")
-                    model_state = state / "resident.json"
-                    previous = (
-                        json.loads(model_state.read_text("utf-8")).get("model")
-                        if model_state.exists()
-                        else None
-                    )
-                    models = running.get("models", [])
-                    if any(
-                        item.get("name") != profile.model and item.get("name") != previous
-                        for item in models
+                    # Ollama has no client ownership/lease API. A local marker (even
+                    # from this process) cannot prove another client is not using a model.
+                    # Switching only waits for natural expiry; it never sends an unload.
+                    while any(
+                        item.get("name") != profile.model for item in running.get("models", [])
                     ):
-                        raise WorkerError(
-                            "MODEL_BUSY",
-                            "Another application has an Ollama model resident; deterministic results returned",
-                        )
-                    for item in models:
-                        old = item.get("name")
-                        if old != profile.model:
-                            await bounded_json(
-                                client,
-                                "POST",
-                                "/api/generate",
-                                {"model": old, "keep_alive": 0, "stream": False},
+                        if not settings.managed_model_switching:
+                            raise WorkerError(
+                                "MODEL_BUSY",
+                                "Another Ollama model is resident; deterministic results returned",
                             )
-                    if any(
-                        item.get("name") != profile.model
-                        for item in (await bounded_json(client, "GET", "/api/ps")).get("models", [])
-                    ):
-                        raise WorkerError(
-                            "MODEL_BUSY",
-                            "Previous model has not unloaded; deterministic results returned",
-                        )
+                        await asyncio.sleep(0.25)
+                        running = await bounded_json(client, "GET", "/api/ps")
                     available = await bounded_json(client, "GET", "/api/tags")
                     if profile.model not in {
                         item.get("name") for item in available.get("models", [])
@@ -130,19 +91,23 @@ async def assist(run, settings, query: str | None, *, transport=None, seconds=No
                         )
                     messages, ids, metrics = assemble(run, profile, query)
                     run.result.statistics.update(metrics)
-                    write_json(model_state, {"model": profile.model})
                     payload = {
                         "model": profile.model,
                         "messages": messages,
                         "format": ModelReply.model_json_schema(),
                         "stream": False,
-                        "keep_alive": settings.keep_alive,
                         "options": {
                             "num_ctx": profile.context_tokens,
                             "num_predict": profile.output_tokens,
                             "temperature": 0,
                         },
                     }
+                    # keep_alive=0 explicitly unloads even a model shared with another
+                    # client. Never request it, including after an initially empty /ps.
+                    if settings.keep_alive != "0":
+                        payload["keep_alive"] = settings.keep_alive
+                    else:
+                        run.note("Zero keep_alive was omitted to avoid unloading a shared model.")
                     for attempt in range(2):
                         response = await bounded_json(client, "POST", "/api/chat", payload)
                         if response.get("done_reason") == "length":

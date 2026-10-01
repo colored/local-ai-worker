@@ -52,34 +52,23 @@ def test_context_omission_is_reported(repo, settings):
     assert any("omitted" in item for item in run.result.limitations)
 
 
-async def test_switch_unloads_before_chat(repo, settings):
+async def test_stale_resident_marker_never_authorizes_unload(repo, settings):
     settings.local_only_confirmed = True
-    resident = ["gemma3:27b"]
     state = Path(settings.state_dir)
     state.mkdir()
-    (state / "resident.json").write_text(json.dumps({"model": resident[0]}), encoding="utf-8")
+    (state / "resident.json").write_text(json.dumps({"model": "gemma3:27b"}), encoding="utf-8")
     calls = []
 
     def handler(request):
         calls.append(request.url.path)
-        if request.url.path == "/api/ps":
-            return httpx.Response(200, json={"models": [{"name": n} for n in resident]})
-        if request.url.path == "/api/generate":
-            assert json.loads(request.content)["keep_alive"] == 0
-            resident.clear()
-            return httpx.Response(200, json={"done": True})
-        if request.url.path == "/api/tags":
-            return httpx.Response(200, json={"models": [{"name": "gemma3:12b"}]})
-        assert not resident
-        return httpx.Response(
-            200, json={"message": {"content": '{"hypotheses": [], "clusters": []}'}}
-        )
+        assert request.url.path == "/api/ps"
+        return httpx.Response(200, json={"models": [{"name": "gemma3:27b"}]})
 
     result = await analyze(
         "project", ProjectRequest(), settings=settings, transport=httpx.MockTransport(handler)
     )
-    assert result.model.used
-    assert calls.index("/api/generate") < calls.index("/api/chat")
+    assert result.facts and not result.model.used
+    assert calls == ["/api/ps"]
 
 
 async def test_other_application_resident_not_unloaded(repo, settings):

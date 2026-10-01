@@ -1,6 +1,7 @@
 import json
 
 import httpx
+import pytest
 
 from local_ai.evidence import Run
 from local_ai.ollama import assist, inference_lock
@@ -140,3 +141,71 @@ async def test_model_timeout(repo, settings):
 
     await assist(run, settings, None, transport=httpx.MockTransport(wait), seconds=0.02)
     assert any("deadline" in item for item in run.result.limitations)
+
+
+@pytest.mark.parametrize("marker", ["stale", "corrupt", "absent"])
+async def test_shared_same_model_never_unloaded(repo, settings, marker):
+    from pathlib import Path
+
+    settings.local_only_confirmed = True
+    settings.keep_alive = "0"
+    state = Path(settings.state_dir)
+    state.mkdir()
+    if marker != "absent":
+        (state / "resident.json").write_text(
+            '{"model": "gemma3:12b"}' if marker == "stale" else "not json"
+        )
+
+    def handler(request):
+        assert request.url.path != "/api/generate"
+        if request.url.path in {"/api/ps", "/api/tags"}:
+            return httpx.Response(200, json={"models": [{"name": "gemma3:12b"}]})
+        assert "keep_alive" not in json.loads(request.content)
+        return httpx.Response(200, json={"message": {"content": '{"hypotheses": []}'}})
+
+    result = await analyze(
+        "project", ProjectRequest(), settings=settings, transport=httpx.MockTransport(handler)
+    )
+    assert result.model.used
+
+
+async def test_opt_in_switch_waits_for_expiry_without_unload(repo, settings):
+    settings.local_only_confirmed = True
+    settings.managed_model_switching = True
+    polls = 0
+
+    def handler(request):
+        nonlocal polls
+        assert request.url.path != "/api/generate"
+        if request.url.path == "/api/ps":
+            polls += 1
+            return httpx.Response(
+                200, json={"models": [{"name": "gemma3:27b"}] if polls == 1 else []}
+            )
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "gemma3:12b"}]})
+        assert polls == 2
+        return httpx.Response(200, json={"message": {"content": '{"hypotheses": []}'}})
+
+    result = await analyze(
+        "project", ProjectRequest(), settings=settings, transport=httpx.MockTransport(handler)
+    )
+    assert result.model.used
+
+
+async def test_switch_wait_is_bounded(repo, settings):
+    from pathlib import Path
+
+    settings.local_only_confirmed = True
+    settings.managed_model_switching = True
+    run = Run(Path(settings.state_dir), repo, "project", "fast", Redactor())
+    run.add("evidence", "source.py")
+
+    def handler(request):
+        assert request.url.path == "/api/ps"
+        return httpx.Response(200, json={"models": [{"name": "gemma3:27b"}]})
+
+    await assist(run, settings, None, transport=httpx.MockTransport(handler), seconds=0.03)
+    assert not run.result.model.used
+    assert any("deadline" in item for item in run.result.limitations)
+    run.close()
