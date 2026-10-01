@@ -1,0 +1,3 @@
+* text=auto eol=lf
+src/local_ai/tokenizers/*.json -text -diff
+src/local_ai/tokenizers/*.terms.html -text -diff -whitespace

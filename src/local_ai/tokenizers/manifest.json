@@ -1,0 +1,12 @@
+{
+  "gemma3": {
+    "source": "unsloth/gemma-3-12b-it",
+    "commit": null,
+    "sha256": "4667f2089529e8e7657cfb6d1c19910ae71ff5f28aa7ab2ff2763330affad795"
+  },
+  "nemotron3": {
+    "source": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+    "commit": null,
+    "sha256": "c6021eb6847e682f89aa52d5eb6e8c7d902a23acfc8137e25211cf84828f1592"
+  }
+}
