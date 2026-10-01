@@ -38,6 +38,10 @@ to `~/Library/Application Support/local-ai-worker/config.toml`. Create this once
 ```toml
 local_only_confirmed = true  # Confirms the daemon configuration above.
 keep_alive = "5m"
+managed_model_switching = false # Opt in to waiting for conflicting models to expire.
+retention_days = 7              # 0 prunes inactive runs at the next maintenance operation.
+max_state_bytes = 268435456     # 256 MiB of state file payloads, including temporary writes.
+sensitive_path_patterns = ["company-vault/*", "*.credentials"] # Adds to built-in denies.
 
 # Defaults are already provided; overrides are optional.
 [profiles.fast]
@@ -66,10 +70,20 @@ matching local `tokenizer = "/absolute/path/tokenizer.json"` in its profile. Tok
 assets and their upstream terms are documented in
 `src/local_ai/tokenizers/NOTICE.md`; no model weights are bundled.
 
-The worker uses a nonblocking cross-process inference lock. A busy worker or a
-conflicting model resident from another application triggers immediate deterministic
-fallback. Switching worker models unloads the previous one first. It does not unload
-another application's model. Ollama clients outside this tool are not coordinated.
+The worker uses a nonblocking cross-process inference lock. A busy worker or any
+conflicting resident model triggers immediate deterministic fallback by default.
+`resident.json` is not ownership evidence and is neither read nor written. Ollama
+has no client ownership/lease API; even the same model may be used by another client.
+The worker never sends unload requests. `keep_alive = "0"` is accepted for config
+compatibility but omitted from requests, with a limitation note, to avoid unloading
+a shared model. Other values retain the existing idle-duration behavior.
+
+With `managed_model_switching = true`, the worker waits for conflicting models to
+expire naturally, polling the loopback resident-model API within the existing run
+deadline. It then uses the requested installed model. If the conflict persists it
+returns deterministic results. This opt-in never authorizes eviction. External
+clients are not coordinated: another client can load a model after the final check,
+so the worker cannot promise exclusive residency or a global memory limit.
 
 ## Daily use
 
@@ -108,7 +122,7 @@ local-ai logs artifacts/run-123 --since 2026-10-01T08:00:00Z
 local-ai evidence RUN_ID e2
 local-ai inspect --profile off --json
 local-ai doctor
-local-ai clean                        # removes completed worker run directories
+local-ai clean                        # removes inactive validated worker run directories
 ```
 
 `query` prioritizes log groups and guides interpretation; it is not an exact-text
@@ -128,7 +142,32 @@ They contain redacted selected excerpts, a result, and a local project locator.
 `get_evidence` returns the captured excerpt, including after a restart; it does not
 reread modified source. Lines are one-based; patches preserve their original hunk
 headers. Large excerpts have an optional continuation cursor. There is no run-management
-MCP tool or long-term evidence database. Clean old runs explicitly with `local-ai clean`.
+MCP tool or long-term evidence database.
+
+Runs start with a versioned ownership manifest marked `incomplete`. Completion is
+recorded only after an atomic result write. Cancellation/interruption updates the
+manifest after collection has stopped; hard crashes leave it incomplete. Public
+result schemas remain unchanged. An OS lock distinguishes active runs from stale
+incomplete ones and is released automatically on process exit.
+
+`local-ai clean` removes inactive validated runs, including stale incomplete runs.
+Automatic maintenance runs before creation and state writes: inactive runs older
+than `retention_days` are pruned, then oldest inactive runs are pruned as needed for
+`max_state_bytes`. Active runs are never pruned. Evidence writes reserve 32 KiB for
+finalization; if quota cannot be met, the write fails with `STATE_QUOTA`. The limit
+counts state file payload sizes (including unknown files), not filesystem block
+allocation. Multiple active runs or external state changes can still prevent final
+writes; the manifest remains safely incomplete in that case.
+
+Cleanup requires a matching worker marker, run ID, timestamp, and known file layout.
+It rejects symlinks, junctions, hardlinked files, special files, and linked state
+ancestors. Unknown, malformed, and legacy manifests are preserved for manual review;
+this includes a crash before the initial manifest could be written. Only validated
+run directories can be deleted. State must be private to the worker's OS user.
+Deletion uses Python's descriptor-based, symlink-resistant `rmtree`; platforms lacking
+it (including Windows) fail closed: `clean` reports `CLEAN_UNSUPPORTED`, automatic
+pruning is disabled, and quota enforcement refuses writes when space runs out.
+A configured state path must not contain symbolic links.
 
 Default limits: 50,000 project entries, 1 MiB per source file, 32 MiB source reads,
 128 MiB log reads, 256 KiB per event, 4 MiB per JSON document (use JSONL for larger
@@ -147,7 +186,18 @@ Read-only guarantees:
 - Source/log content and instruction files are data, never worker instructions.
 - Strict model JSON validation, evidence-ID checks, and input/output secret screening.
 
-Authentication source code is allowed. Supported screening covers named password,
+Credential paths are denied before source reads, Git patch/blob reads, and log
+reads. Defaults include `.env` and `.env.*` (including example files), `.ssh`, `.aws`,
+`.azure`, `.gnupg`, `.kube`, `.docker`, Google Cloud credential directories, common
+credential files, and private-key/keystore extensions. `sensitive_path_patterns`
+adds case-insensitive shell globs over project-relative paths or individual path
+components; separators are normalized and `*` can match `/`. Built-in denies cannot
+be disabled. Denied paths are omitted from project and diff inventories/counts.
+Ordinary authentication source such as `src/auth.py` and `src/authentication.ts`
+remains eligible. Regex redaction still screens all admitted content as defense
+in depth; path policy cannot identify credentials stored under arbitrary names.
+
+Supported screening covers named password,
 token, API-key, cookie/session fields, authorization headers, common credential token
 formats, private-key blocks, and credential-bearing URLs/connection strings. Extra
 bounded regex patterns can be configured with `extra_secret_patterns`. Screening does
@@ -167,12 +217,17 @@ CLI exit codes: `0` completed/partial usable result, `2` invalid input or config
 ```bash
 uv sync --locked
 uv run pytest -q
-uv run ruff check src tests
-uv build
+uv run ruff check src tests tools
+uv build --wheel
 ```
 
 Tests use unrelated fixture repositories, real Git and a real stdio MCP subprocess,
 with mocked Ollama. No live model or external network is required for tests.
+GitHub Actions runs locked dependency sync, the full suite, Ruff, and wheel build
+on Linux/macOS with Python 3.12/3.13. It installs each wheel into a clean environment
+outside the checkout and runs `tools/verify_wheel.py` to load all bundled prompts
+and tokenizers, verify tokenizer hashes, check notices/licenses, and report wheel
+size. This workflow does not publish releases.
 
 Before everyday use on the target M5 Pro MacBook:
 
